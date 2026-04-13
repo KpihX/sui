@@ -1,0 +1,6 @@
+# Agent / local noise
+.agents/
+
+# Secrets
+*.env
+.env.*
