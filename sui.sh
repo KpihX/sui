@@ -38,7 +38,7 @@
 #     flows (e.g. zenity cancel) without needing `|| true` everywhere.
 set -uo pipefail
 
-readonly SUI_VERSION="3.1.2"
+readonly SUI_VERSION="3.1.3"
 
 # ---------------------------------------------------------------------------
 # Globals (shared state for parse_args, audit logging, and execution helpers)
@@ -71,6 +71,8 @@ EXIT_CANCELLED=130
 EXIT_AUTH_FAILED=77
 JSON_MODE=0
 SUI_REASON=""
+REQUIRE_REASON=1
+REASON_MAX_ATTEMPTS=3
 
 # ---------------------------------------------------------------------------
 usage() {
@@ -228,6 +230,33 @@ notify_auth_failure() {
   if have_zenity_gui; then
     zenity_run --error --title="sui — authentication failed" --text="$msg" --width=520 --height=160 || true
   fi
+}
+
+prompt_reason_retry() {
+  local prompt_title="sui — reason required"
+  local prompt_text="Provide a short rationale for this privileged command."
+  local i reason_input
+  for ((i=1; i<=REASON_MAX_ATTEMPTS; i++)); do
+    if have_zenity_gui; then
+      reason_input="$(zenity_run --entry --title="${prompt_title} [${i}/${REASON_MAX_ATTEMPTS}]" --text="$prompt_text" --width=520 --height=160)" || {
+        printf '%s\n' "sui: rationale input cancelled by user." >&2
+        continue
+      }
+    else
+      if [[ ! -t 0 ]]; then
+        printf '%s\n' "sui: rationale required but no GUI and no interactive TTY." >&2
+        return "$EXIT_CANCELLED"
+      fi
+      read -r -p "sui: rationale [${i}/${REASON_MAX_ATTEMPTS}]: " reason_input || true
+    fi
+    if [[ -n "${reason_input// }" ]]; then
+      SUI_REASON="$reason_input"
+      return 0
+    fi
+    printf '%s\n' "sui: rationale cannot be empty (${i}/${REASON_MAX_ATTEMPTS})." >&2
+  done
+  printf '%s\n' "sui: aborted because rationale was not provided after ${REASON_MAX_ATTEMPTS} attempts." >&2
+  return "$EXIT_CANCELLED"
 }
 
 LOCAL_AUTH_FAILED=0
@@ -590,6 +619,14 @@ parse_args() {
         fi
         shift
         ;;
+      --__require-reason)
+        REQUIRE_REASON=1
+        shift
+        ;;
+      --__no-require-reason)
+        REQUIRE_REASON=0
+        shift
+        ;;
       --sudo-cache)
         SUDO_CACHE=1
         shift
@@ -668,6 +705,10 @@ main() {
 
   # Parsed command + argv (flags and @target already stripped).
   SUI_CMD_REPR="$(cmd_repr "${SUI_CMD[@]}")"
+
+  if [[ "$REQUIRE_REASON" -eq 1 ]] && [[ -z "${SUI_REASON// }" ]]; then
+    prompt_reason_retry || exit "$?"
+  fi
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
     sui_audit "dry-run"

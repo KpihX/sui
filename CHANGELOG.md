@@ -4,6 +4,15 @@ All notable changes to `sui` are documented in this file.
 
 The format is inspired by Keep a Changelog and this project follows Semantic Versioning.
 
+## [3.1.3] - 2026-04-13
+
+### Added
+- Mandatory rationale enforcement path (default ON): privileged execution now requires `--reason` or an interactive rationale prompt.
+- Interactive rationale retry loop (max 3 attempts) before abort.
+- Hidden internal toggles for advanced automation:
+  - `--__require-reason`
+  - `--__no-require-reason`
+
 ## [3.1.2] - 2026-04-13
 
 ### Added
