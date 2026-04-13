@@ -38,7 +38,7 @@
 #     flows (e.g. zenity cancel) without needing `|| true` everywhere.
 set -uo pipefail
 
-readonly SUI_VERSION="3.1.1"
+readonly SUI_VERSION="3.1.2"
 
 # ---------------------------------------------------------------------------
 # Globals (shared state for parse_args, audit logging, and execution helpers)
@@ -70,6 +70,7 @@ AUTH_MAX_ATTEMPTS=3
 EXIT_CANCELLED=130
 EXIT_AUTH_FAILED=77
 JSON_MODE=0
+SUI_REASON=""
 
 # ---------------------------------------------------------------------------
 usage() {
@@ -85,6 +86,7 @@ Options (must appear before @target and command):
   --dry-run    Show intent only; no password; no execution.
   --doctor     Print runtime diagnostics (zenity/pkexec/sudo/ssh/gui/tty).
   --json       Machine-readable output for doctor mode.
+  --reason TXT Human rationale shown in the privilege dialog.
   --sudo-cache    Allow sudo timestamp cache (fewer prompts, less strict).
   --no-sudo-cache Enforce secure mode (default): invalidate timestamp each run.
   -h, --help   This help.
@@ -95,6 +97,7 @@ Environment:
 
 Examples:
   sui apt update
+  sui --reason "Refresh security indexes" apt update
   sui --dry-run @docker-host systemctl restart nginx
   sui --polkit -- gparted
 
@@ -144,6 +147,7 @@ Context
   CWD:       $(pwd 2>/dev/null || echo unknown)
   Time:      $(date -Iseconds 2>/dev/null || date)
   Channel:   ${mode}
+  Rationale: ${SUI_REASON:-<none provided>}
 
 =============================================================
 COMMAND (exact argv · bash-quoted · runs as root after OK)
@@ -165,7 +169,7 @@ EOF
 sui_audit() {
   local phase=$1
   local msg
-  msg="phase=${phase} scope=${SUI_SCOPE} target=${SUI_TARGET} invoker=${SUI_INVOKER} uid=${SUI_UID} cmd=${SUI_CMD_REPR}"
+  msg="phase=${phase} scope=${SUI_SCOPE} target=${SUI_TARGET} invoker=${SUI_INVOKER} uid=${SUI_UID} cmd=${SUI_CMD_REPR} reason=${SUI_REASON:-<none>}"
 
   if command -v logger >/dev/null 2>&1; then
     # dry-run is not a real authentication event — keep it out of authpriv by default
@@ -226,40 +230,65 @@ notify_auth_failure() {
   fi
 }
 
-sudo_validate_local_password() {
+LOCAL_AUTH_FAILED=0
+sudo_execute_local_with_password() {
   local pass=$1
-  if [[ "$SUDO_CACHE" -eq 1 ]]; then
-    printf '%s\n' "$pass" | sudo -S -p '' -v >/dev/null 2>&1
-  else
-    printf '%s\n' "$pass" | sudo -S -k -p '' -v >/dev/null 2>&1
-  fi
-}
-
-sudo_execute_local_with_ticket() {
+  shift
   local ec
-  sudo -n -p '' -- "$@"
-  ec=$?
+  local kflag=""
+  local err_file=""
+  local err_text=""
   if [[ "$SUDO_CACHE" -eq 0 ]]; then
+    kflag="-k"
+  fi
+  err_file="$(mktemp)"
+  printf '%s\n' "$pass" | sudo -S ${kflag} -p '' -- "$@" 2>"$err_file"
+  ec=$?
+
+  LOCAL_AUTH_FAILED=0
+  err_text="$(<"$err_file")"
+  if [[ "$ec" -ne 0 ]]; then
+    if remote_is_auth_error_text "$err_text" || [[ "$err_text" == *"interactive authentication is required"* ]]; then
+      LOCAL_AUTH_FAILED=1
+    elif [[ -n "$err_text" ]]; then
+      printf '%s\n' "$err_text" >&2
+    fi
+  elif [[ -n "$err_text" ]]; then
+    printf '%s\n' "$err_text" >&2
+  fi
+
+  rm -f "$err_file"
+  if [[ "$SUDO_CACHE" -eq 0 && "$ec" -eq 0 ]]; then
     sudo -k >/dev/null 2>&1 || true
   fi
   return "$ec"
 }
 
-sudo_validate_remote_password() {
-  local target=$1
-  local pass=$2
-  if [[ "$SUDO_CACHE" -eq 1 ]]; then
-    printf '%s\n' "$pass" | ssh -o 'BatchMode=no' -- "$target" 'sudo -S -p "" -v' >/dev/null 2>&1
-  else
-    printf '%s\n' "$pass" | ssh -o 'BatchMode=no' -- "$target" 'sudo -S -k -p "" -v' >/dev/null 2>&1
-  fi
+REMOTE_AUTH_FAILED=0
+remote_is_auth_error_text() {
+  local txt=$1
+  [[ "$txt" == *"Authentication failed"* ]] || \
+  [[ "$txt" == *"a password is required"* ]] || \
+  [[ "$txt" == *"incorrect authentication attempts"* ]] || \
+  [[ "$txt" == *"try again"* ]]
 }
 
-sudo_execute_remote_with_ticket() {
+sudo_execute_remote_with_password() {
   local target=$1
+  local pass=$2
+  shift
   shift
   local ec
+  local kflag=""
+  local err_file=""
+
+  if [[ "$SUDO_CACHE" -eq 0 ]]; then
+    kflag="-k"
+  fi
+  err_file="$(mktemp)"
+
   {
+    printf '%s\n' "$pass"
     printf 'set -euo pipefail\n'
     printf 'exec'
     local a
@@ -267,9 +296,28 @@ sudo_execute_remote_with_ticket() {
       printf ' %q' "$a"
     done
     printf '\n'
-  } | ssh -o 'BatchMode=no' -- "$target" 'sudo -n -p "" -- bash -s'
+  } | ssh -o 'BatchMode=no' -- "$target" "sudo -S ${kflag} -p \"\" -- bash -s" 2>"$err_file"
   ec=$?
-  if [[ "$SUDO_CACHE" -eq 0 ]]; then
+
+  REMOTE_AUTH_FAILED=0
+  local err_text=""
+  err_text="$(<"$err_file")"
+
+  if [[ "$ec" -ne 0 ]]; then
+    if remote_is_auth_error_text "$err_text"; then
+      REMOTE_AUTH_FAILED=1
+    elif [[ -n "$err_text" ]]; then
+      # Non-auth remote errors should still be visible to the operator.
+      printf '%s\n' "$err_text" >&2
+    fi
+  elif [[ -n "$err_text" ]]; then
+    # Preserve stderr coming from a successful remote command.
+    printf '%s\n' "$err_text" >&2
+  fi
+
+  rm -f "$err_file"
+
+  if [[ "$SUDO_CACHE" -eq 0 && "$ec" -eq 0 ]]; then
     ssh -o 'BatchMode=no' -- "$target" 'sudo -n -k' >/dev/null 2>&1 || true
   fi
   return "$ec"
@@ -342,7 +390,8 @@ zenity_password() {
 }
 
 notify_dry_run() {
-  local text text="$(zenity_body "DRY-RUN" "$SUI_TARGET" "$@")"
+  local text
+  text="$(zenity_body "DRY-RUN" "$SUI_TARGET" "$@")"
   if have_zenity_gui; then
     zenity_run --info --title="sui — dry-run" --text="$text" --width=720 --height=480
   else
@@ -365,7 +414,9 @@ run_local_pkexec() {
     return 1
   fi
   sui_audit "invoke"
-  exec pkexec -- "$@"
+  # pkexec does not use GNU-style "--" separator here; passing it makes pkexec
+  # try to execute a literal program named "--".
+  exec pkexec "$@"
 }
 
 run_local_zenity_sudo() {
@@ -401,13 +452,16 @@ run_local_zenity_sudo() {
     esac
     PASS="$zpwd"
     unset -v zpwd
-    if sudo_validate_local_password "$PASS"; then
-      unset -v PASS
-      sui_audit "invoke"
-      sudo_execute_local_with_ticket "$@"
-      return $?
-    fi
+    sudo_execute_local_with_password "$PASS" "$@"
+    local local_ec=$?
     unset -v PASS
+    if [[ "$local_ec" -eq 0 ]]; then
+      sui_audit "invoke"
+      return 0
+    fi
+    if [[ "$LOCAL_AUTH_FAILED" -ne 1 ]]; then
+      return "$local_ec"
+    fi
     if [[ "$attempt" -lt "$AUTH_MAX_ATTEMPTS" ]]; then
       notify_auth_failure "Authentication failed (${attempt}/${AUTH_MAX_ATTEMPTS}). Please try again."
     fi
@@ -471,13 +525,16 @@ run_remote_zenity_sudo() {
     esac
     PASS="$zpwd"
     unset -v zpwd
-    if sudo_validate_remote_password "$target" "$PASS"; then
-      unset -v PASS
-      sui_audit "invoke"
-      sudo_execute_remote_with_ticket "$target" "$@"
-      return $?
-    fi
+    sudo_execute_remote_with_password "$target" "$PASS" "$@"
+    local remote_ec=$?
     unset -v PASS
+    if [[ "$remote_ec" -eq 0 ]]; then
+      sui_audit "invoke"
+      return 0
+    fi
+    if [[ "$REMOTE_AUTH_FAILED" -ne 1 ]]; then
+      return "$remote_ec"
+    fi
     if [[ "$attempt" -lt "$AUTH_MAX_ATTEMPTS" ]]; then
       notify_auth_failure "Remote authentication failed (${attempt}/${AUTH_MAX_ATTEMPTS}) for @${target}. Please try again."
     fi
@@ -497,6 +554,7 @@ parse_args() {
   DOCTOR_MODE=0
   SUDO_CACHE=0
   JSON_MODE=0
+  SUI_REASON=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --polkit)
@@ -513,6 +571,23 @@ parse_args() {
         ;;
       --json)
         JSON_MODE=1
+        shift
+        ;;
+      --reason)
+        shift
+        if [[ $# -lt 1 ]]; then
+          printf '%s\n' "sui: --reason requires a non-empty value." >&2
+          exit 2
+        fi
+        SUI_REASON="$1"
+        shift
+        ;;
+      --reason=*)
+        SUI_REASON="${1#*=}"
+        if [[ -z "$SUI_REASON" ]]; then
+          printf '%s\n' "sui: --reason requires a non-empty value." >&2
+          exit 2
+        fi
         shift
         ;;
       --sudo-cache)

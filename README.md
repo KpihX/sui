@@ -9,6 +9,7 @@ Unified graphical gateway for **local** and **remote** privileged commands on Li
 - `--dry-run` to preview without elevation.
 - `doctor` / `--doctor` runtime diagnostic mode (GUI/TTY/tools availability + fallback order).
 - `--json` machine-readable output for `doctor` mode.
+- `--reason "..."` to provide a human rationale shown in the elevation dialog.
 - `--sudo-cache` / `--no-sudo-cache` to control sudo timestamp behavior (default: secure no-cache).
 - Optional `SUI_LOG=1` for `${XDG_STATE_HOME}/sui/audit.log`.
 - Syslog audit via `logger -p authpriv.notice` (often merged into `/var/log/auth.log` on traditional setups).
@@ -73,6 +74,7 @@ sui --help
 sui [options] [@ssh-host] <command> [args...]
 sui doctor
 sui --doctor --json
+sui --reason "why this needs privilege" <command>
 ```
 
 Cache mode examples:
@@ -83,6 +85,9 @@ sui --no-sudo-cache apt update
 
 # allow sudo timestamp cache (fewer prompts)
 sui --sudo-cache apt update
+
+# provide rationale visible in the popup
+sui --reason "Refresh package metadata before maintenance window" apt update
 ```
 
 See `sui --help` or the header of `sui.sh`.
@@ -127,7 +132,7 @@ This project is security/ops-sensitive, so keep release hygiene strict:
 
 Older examples used `zenity --password --text=…`. On Zenity **4.x**, that mode often **drops `--text`** and only shows the generic “Type your password” line, so you cannot see e.g. `apt update` in the dialog.
 
-`sui` **v3.0.1+** uses `zenity --forms` with `--text` (full briefing) and `--add-password`. **v3.0.3+** keeps the exact command line always visible and visually emphasized in the dialog body (never concealed).
+`sui` **v3.0.1+** uses a Zenity prompt mode that keeps `--text` visible. Current builds use `zenity --entry --hide-text` so Enter reliably validates and the command briefing remains visible.
 
 ### What if `zenity` is absent or no GUI is available?
 
@@ -168,6 +173,12 @@ sui doctor
 sui --dry-run apt update
 sui --dry-run @docker-host systemctl restart nginx
 sui --doctor --json
+```
+
+Live interactive smoke suite:
+
+```bash
+tests/live-smoke.sh
 ```
 
 Authentication retry behavior:
