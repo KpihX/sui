@@ -38,7 +38,7 @@
 #     flows (e.g. zenity cancel) without needing `|| true` everywhere.
 set -uo pipefail
 
-readonly SUI_VERSION="3.0.0"
+readonly SUI_VERSION="3.0.1"
 
 # ---------------------------------------------------------------------------
 # Globals (shared state for parse_args, audit logging, and execution helpers)
@@ -181,8 +181,13 @@ zenity_password() {
     printf '%s\n' "sui: no DISPLAY/WAYLAND_DISPLAY; cannot show zenity." >&2
     return 1
   fi
-  # --text is shown above the password entry → single combined dialog.
-  zenity --password --title="$title" --text="$text" --width=720 --height=480
+  # Zenity 4.x: `zenity --password` often ignores `--text` and only shows the stock
+  # "Type your password" label, so the argv briefing (and thus e.g. "apt update") never appears.
+  # `--forms` honors `--text` and still collects a secret with `--add-password`. A single
+  # password field prints only the password on stdout (no separator).
+  zenity --forms --title="$title" --text="$text" \
+    --add-password="Password" \
+    --width=720 --height=520
 }
 
 notify_dry_run() {
@@ -217,8 +222,9 @@ run_local_zenity_sudo() {
     printf '%s\n' "sui: sudo not found." >&2
     return 1
   fi
-  local body title zpwd
-  title="sui — local sudo [${SUI_INVOKER}]"
+  local body title zpwd summary
+  summary="$(cmd_repr "$@")"
+  title="sui — local sudo [${SUI_INVOKER}] — ${summary}"
   body="$(zenity_body "LOCAL-ZENITY" "local" "$@")"
   zpwd="$(zenity_password "$title" "$body")" || {
     sui_audit "cancel"
@@ -264,8 +270,9 @@ run_remote_zenity_sudo() {
   shift
   # Remote machine must provide sudo(8); we cannot probe it without a session. A missing remote sudo
   # surfaces as a non-zero ssh exit code.
-  local body title zpwd
-  title="sui — remote sudo [@${target}]"
+  local body title zpwd summary
+  summary="$(cmd_repr "$@")"
+  title="sui — remote sudo [@${target}] — ${summary}"
   body="$(zenity_body "REMOTE-ZENITY" "$target" "$@")"
   zpwd="$(zenity_password "$title" "$body")" || {
     sui_audit "cancel"

@@ -73,6 +73,18 @@ git remote add gitlab git@gitlab.com:kpihx/sui.git
 
 Then `make push` from the `sui` repo root pushes both hosts.
 
+## Troubleshooting
+
+### Password dialog does not show the command (Zenity 4.x)
+
+Older examples used `zenity --password --text=…`. On Zenity **4.x**, that mode often **drops `--text`** and only shows the generic “Type your password” line, so you cannot see e.g. `apt update` in the dialog.
+
+`sui` **v3.0.1+** uses `zenity --forms` with `--text` (full briefing) and `--add-password` so the command stays visible.
+
+### `MESA-INTEL` lines in the terminal when the dialog opens
+
+Launching the GTK/Zenity stack may print **harmless** Intel Vulkan driver warnings to **stderr**. They are **not** from `apt` or `sudo`. After you confirm the dialog, normal command output should follow.
+
 ## License
 
 Private / personal tooling — see repository owner policy.
