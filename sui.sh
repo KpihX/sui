@@ -38,7 +38,7 @@
 #     flows (e.g. zenity cancel) without needing `|| true` everywhere.
 set -uo pipefail
 
-readonly SUI_VERSION="3.0.3"
+readonly SUI_VERSION="3.1.0"
 
 # ---------------------------------------------------------------------------
 # Globals (shared state for parse_args, audit logging, and execution helpers)
@@ -65,6 +65,10 @@ USE_POLKIT=0
 DRY_RUN=0
 # Sudo password from zenity; kept only between read and first sudo/ssh pipe, then unset -v PASS.
 PASS=""
+SUDO_CACHE=0
+AUTH_MAX_ATTEMPTS=3
+EXIT_CANCELLED=130
+EXIT_AUTH_FAILED=77
 
 # ---------------------------------------------------------------------------
 usage() {
@@ -73,14 +77,19 @@ sui — Sudo User Interface (privileged command gateway)
 
 Usage:
   sui [options] [@ssh-target] <command> [args...]
+  sui doctor
 
 Options (must appear before @target and command):
   --polkit     Local elevation via pkexec (Polkit). Ignored for remote targets.
   --dry-run    Show intent only; no password; no execution.
+  --doctor     Print runtime diagnostics (zenity/pkexec/sudo/ssh/gui/tty).
+  --sudo-cache    Allow sudo timestamp cache (fewer prompts, less strict).
+  --no-sudo-cache Enforce secure mode (default): invalidate timestamp each run.
   -h, --help   This help.
 
 Environment:
   SUI_LOG=1    Also append audit lines to $XDG_STATE_HOME/sui/audit.log (default: ~/.local/state).
+  SUI_ZENITY_STDERR=1  Keep zenity stderr visible (default: suppress GUI/MESA noise).
 
 Examples:
   sui apt update
@@ -134,13 +143,13 @@ Context
   Time:      $(date -Iseconds 2>/dev/null || date)
   Channel:   ${mode}
 
->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-   COMMAND  (exact argv · bash-quoted · runs as root after OK)
->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+=============================================================
+COMMAND (exact argv · bash-quoted · runs as root after OK)
+=============================================================
 
   ${pretty}
 
-<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+=============================================================
 
 Enter your password in the field below, or Cancel.
 EOF
@@ -181,30 +190,125 @@ have_display() {
   [[ -n "${DISPLAY:-}" ]] || [[ -n "${WAYLAND_DISPLAY:-}" ]]
 }
 
+have_zenity_gui() {
+  command -v zenity >/dev/null 2>&1 && have_display
+}
+
+zenity_run() {
+  # Force GTK software/cairo rendering to avoid noisy Vulkan/MESA warnings on some Intel stacks.
+  # By default we silence remaining GUI stderr noise; set SUI_ZENITY_STDERR=1 to debug.
+  if [[ "${SUI_ZENITY_STDERR:-0}" == "1" ]]; then
+    GSK_RENDERER=cairo zenity "$@"
+  else
+    GSK_RENDERER=cairo zenity "$@" 2>/dev/null
+  fi
+}
+
+tty_password_prompt() {
+  local prompt=$1
+  local p1=""
+  if [[ ! -t 0 ]]; then
+    return 1
+  fi
+  read -r -s -p "$prompt" p1
+  printf '\n' >&2
+  printf '%s' "$p1"
+}
+
+notify_auth_failure() {
+  local msg=$1
+  # Always print to shell for traceability, even when a GUI popup is shown.
+  printf '%s\n' "sui: $msg" >&2
+  if have_zenity_gui; then
+    zenity_run --error --title="sui — authentication failed" --text="$msg" --width=520 --height=160 || true
+  fi
+}
+
+sudo_validate_local_password() {
+  local pass=$1
+  if [[ "$SUDO_CACHE" -eq 1 ]]; then
+    printf '%s\n' "$pass" | sudo -S -p '' -v >/dev/null 2>&1
+  else
+    printf '%s\n' "$pass" | sudo -S -k -p '' -v >/dev/null 2>&1
+  fi
+}
+
+sudo_execute_local_with_ticket() {
+  local ec
+  sudo -n -p '' -- "$@"
+  ec=$?
+  if [[ "$SUDO_CACHE" -eq 0 ]]; then
+    sudo -k >/dev/null 2>&1 || true
+  fi
+  return "$ec"
+}
+
+sudo_validate_remote_password() {
+  local target=$1
+  local pass=$2
+  if [[ "$SUDO_CACHE" -eq 1 ]]; then
+    printf '%s\n' "$pass" | ssh -o 'BatchMode=no' -- "$target" 'sudo -S -p "" -v' >/dev/null 2>&1
+  else
+    printf '%s\n' "$pass" | ssh -o 'BatchMode=no' -- "$target" 'sudo -S -k -p "" -v' >/dev/null 2>&1
+  fi
+}
+
+sudo_execute_remote_with_ticket() {
+  local target=$1
+  shift
+  local ec
+  {
+    printf 'set -euo pipefail\n'
+    printf 'exec'
+    local a
+    for a in "$@"; do
+      printf ' %q' "$a"
+    done
+    printf '\n'
+  } | ssh -o 'BatchMode=no' -- "$target" 'sudo -n -p "" -- bash -s'
+  ec=$?
+  if [[ "$SUDO_CACHE" -eq 0 ]]; then
+    ssh -o 'BatchMode=no' -- "$target" 'sudo -n -k' >/dev/null 2>&1 || true
+  fi
+  return "$ec"
+}
+
+print_doctor() {
+  printf '%s\n' "sui doctor v${SUI_VERSION}"
+  printf '%s\n' "---------------------"
+  printf 'user: %s (uid %s)\n' "$(id -un)" "$(id -u)"
+  printf 'cwd: %s\n' "$(pwd)"
+  printf 'display: DISPLAY=%s WAYLAND_DISPLAY=%s\n' "${DISPLAY:-<unset>}" "${WAYLAND_DISPLAY:-<unset>}"
+  printf 'tty-stdin: %s\n' "$([[ -t 0 ]] && echo yes || echo no)"
+  printf 'tty-stdout: %s\n' "$([[ -t 1 ]] && echo yes || echo no)"
+  printf 'zenity: %s\n' "$({ command -v zenity >/dev/null 2>&1 && echo yes || echo no; })"
+  printf 'pkexec: %s\n' "$({ command -v pkexec >/dev/null 2>&1 && echo yes || echo no; })"
+  printf 'sudo: %s\n' "$({ command -v sudo >/dev/null 2>&1 && echo yes || echo no; })"
+  printf 'ssh: %s\n' "$({ command -v ssh >/dev/null 2>&1 && echo yes || echo no; })"
+  printf 'gui-capable-now: %s\n' "$({ have_zenity_gui && echo yes || echo no; })"
+  printf '%s\n' ""
+  printf '%s\n' "fallback-order-local: zenity -> pkexec -> tty-password+sudo"
+  printf '%s\n' "fallback-order-remote: zenity -> tty-password+ssh+sudo"
+  printf 'sudo-cache-mode: %s\n' "$([[ "$SUDO_CACHE" -eq 1 ]] && echo enabled || echo secure-disabled)"
+}
+
 zenity_password() {
   local title=$1
   local text=$2
-  if ! command -v zenity >/dev/null 2>&1; then
-    printf '%s\n' "sui: zenity not installed; cannot show GUI password prompt." >&2
-    return 1
+  if ! have_zenity_gui; then
+    return 2
   fi
-  if ! have_display; then
-    printf '%s\n' "sui: no DISPLAY/WAYLAND_DISPLAY; cannot show zenity." >&2
-    return 1
-  fi
-  # Zenity 4.x: `zenity --password` often ignores `--text` and only shows the stock
-  # "Type your password" label, so the argv briefing (and thus e.g. "apt update") never appears.
-  # `--forms` honors `--text` and still collects a secret with `--add-password`. A single
-  # password field prints only the password on stdout (no separator).
-  zenity --forms --title="$title" --text="$text" \
-    --add-password="Password (sudo)" \
+  # Use --entry --hide-text so Enter in the focused password field validates the dialog
+  # consistently as "OK", while still showing our full command/context text.
+  zenity_run --entry --hide-text --title="$title" --text="$text" \
+    --ok-label="OK" --cancel-label="Cancel" \
     --width=780 --height=620
 }
 
 notify_dry_run() {
   local text text="$(zenity_body "DRY-RUN" "$SUI_TARGET" "$@")"
-  if command -v zenity >/dev/null 2>&1 && have_display; then
-    zenity --info --title="sui — dry-run" --text="$text" --width=720 --height=480
+  if have_zenity_gui; then
+    zenity_run --info --title="sui — dry-run" --text="$text" --width=720 --height=480
   else
     printf '%s\n' "$text"
   fi
@@ -233,22 +337,49 @@ run_local_zenity_sudo() {
     printf '%s\n' "sui: sudo not found." >&2
     return 1
   fi
-  local body title zpwd summary
+  local body title zpwd summary attempt
   summary="$(cmd_repr "$@")"
   title="sui — local sudo [${SUI_INVOKER}] — ${summary}"
   body="$(zenity_body "LOCAL-ZENITY" "local" "$@")"
-  zpwd="$(zenity_password "$title" "$body")" || {
-    sui_audit "cancel"
-    return 1
-  }
-  PASS="$zpwd"
-  unset -v zpwd
-  sui_audit "invoke"
-  # Empty prompt: sudo must not write to stderr for password (we use -S).
-  printf '%s\n' "$PASS" | sudo -S -p '' -- "$@"
-  local ec=$?
-  unset -v PASS
-  return "$ec"
+  for ((attempt=1; attempt<=AUTH_MAX_ATTEMPTS; attempt++)); do
+    zpwd="$(zenity_password "${title} [${attempt}/${AUTH_MAX_ATTEMPTS}]" "$body")"
+    case $? in
+      0) ;;
+      2)
+        # No GUI zenity available: prefer pkexec locally, then TTY password fallback.
+        if command -v pkexec >/dev/null 2>&1; then
+          run_local_pkexec "$@"
+          return $?
+        fi
+        zpwd="$(tty_password_prompt "sui: sudo password for ${SUI_INVOKER}: ")" || {
+          printf '%s\n' "sui: no GUI available and no interactive TTY password input possible." >&2
+          sui_audit "cancel"
+          return "$EXIT_CANCELLED"
+        }
+        ;;
+      *)
+        printf '%s\n' "sui: authentication cancelled by user (local)." >&2
+        sui_audit "cancel"
+        return "$EXIT_CANCELLED"
+        ;;
+    esac
+    PASS="$zpwd"
+    unset -v zpwd
+    if sudo_validate_local_password "$PASS"; then
+      unset -v PASS
+      sui_audit "invoke"
+      sudo_execute_local_with_ticket "$@"
+      return $?
+    fi
+    unset -v PASS
+    if [[ "$attempt" -lt "$AUTH_MAX_ATTEMPTS" ]]; then
+      notify_auth_failure "Authentication failed (${attempt}/${AUTH_MAX_ATTEMPTS}). Please try again."
+    fi
+  done
+  notify_auth_failure "Authentication failed ${AUTH_MAX_ATTEMPTS} times. Aborting."
+  printf '%s\n' "sui: local sudo aborted after ${AUTH_MAX_ATTEMPTS} failed attempts." >&2
+  sui_audit "cancel"
+  return "$EXIT_AUTH_FAILED"
 }
 
 # ---------------------------------------------------------------------------
@@ -281,30 +412,44 @@ run_remote_zenity_sudo() {
   shift
   # Remote machine must provide sudo(8); we cannot probe it without a session. A missing remote sudo
   # surfaces as a non-zero ssh exit code.
-  local body title zpwd summary
+  local body title zpwd summary attempt
   summary="$(cmd_repr "$@")"
   title="sui — remote sudo [@${target}] — ${summary}"
   body="$(zenity_body "REMOTE-ZENITY" "$target" "$@")"
-  zpwd="$(zenity_password "$title" "$body")" || {
-    sui_audit "cancel"
-    return 1
-  }
-  PASS="$zpwd"
-  unset -v zpwd
-  sui_audit "invoke"
-  {
-    printf '%s\n' "$PASS"
-    printf 'set -euo pipefail\n'
-    printf 'exec'
-    local a
-    for a in "$@"; do
-      printf ' %q' "$a"
-    done
-    printf '\n'
-  } | ssh -o 'BatchMode=no' -- "$target" 'sudo -S -p "" -- bash -s'
-  local ec=$?
-  unset -v PASS
-  return "$ec"
+  for ((attempt=1; attempt<=AUTH_MAX_ATTEMPTS; attempt++)); do
+    zpwd="$(zenity_password "${title} [${attempt}/${AUTH_MAX_ATTEMPTS}]" "$body")"
+    case $? in
+      0) ;;
+      2)
+        zpwd="$(tty_password_prompt "sui: remote sudo password for @${target}: ")" || {
+          printf '%s\n' "sui: no GUI available and no interactive TTY password input possible." >&2
+          sui_audit "cancel"
+          return "$EXIT_CANCELLED"
+        }
+        ;;
+      *)
+        printf '%s\n' "sui: authentication cancelled by user (remote @${target})." >&2
+        sui_audit "cancel"
+        return "$EXIT_CANCELLED"
+        ;;
+    esac
+    PASS="$zpwd"
+    unset -v zpwd
+    if sudo_validate_remote_password "$target" "$PASS"; then
+      unset -v PASS
+      sui_audit "invoke"
+      sudo_execute_remote_with_ticket "$target" "$@"
+      return $?
+    fi
+    unset -v PASS
+    if [[ "$attempt" -lt "$AUTH_MAX_ATTEMPTS" ]]; then
+      notify_auth_failure "Remote authentication failed (${attempt}/${AUTH_MAX_ATTEMPTS}) for @${target}. Please try again."
+    fi
+  done
+  notify_auth_failure "Remote authentication failed ${AUTH_MAX_ATTEMPTS} times for @${target}. Aborting."
+  printf '%s\n' "sui: remote sudo aborted for @${target} after ${AUTH_MAX_ATTEMPTS} failed attempts." >&2
+  sui_audit "cancel"
+  return "$EXIT_AUTH_FAILED"
 }
 
 # ---------------------------------------------------------------------------
@@ -313,6 +458,8 @@ run_remote_zenity_sudo() {
 parse_args() {
   USE_POLKIT=0
   DRY_RUN=0
+  DOCTOR_MODE=0
+  SUDO_CACHE=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --polkit)
@@ -321,6 +468,18 @@ parse_args() {
         ;;
       --dry-run)
         DRY_RUN=1
+        shift
+        ;;
+      --doctor)
+        DOCTOR_MODE=1
+        shift
+        ;;
+      --sudo-cache)
+        SUDO_CACHE=1
+        shift
+        ;;
+      --no-sudo-cache)
+        SUDO_CACHE=0
         shift
         ;;
       -h|--help)
@@ -336,6 +495,10 @@ parse_args() {
         ;;
     esac
   done
+
+  if [[ "$DOCTOR_MODE" -eq 1 && $# -lt 1 ]]; then
+    return 0
+  fi
 
   if [[ $# -lt 1 ]]; then
     printf '%s\n' "sui: missing command (see sui --help)." >&2
@@ -365,7 +528,17 @@ main() {
   SUI_INVOKER="$(id -un)"
   SUI_UID="$(id -u)"
 
+  if [[ "${1:-}" == "doctor" ]]; then
+    print_doctor
+    exit 0
+  fi
+
   parse_args "$@"
+
+  if [[ "${DOCTOR_MODE:-0}" -eq 1 ]]; then
+    print_doctor
+    exit 0
+  fi
 
   # Parsed command + argv (flags and @target already stripped).
   SUI_CMD_REPR="$(cmd_repr "${SUI_CMD[@]}")"
