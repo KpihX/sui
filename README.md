@@ -8,6 +8,7 @@ Unified graphical gateway for **local** and **remote** privileged commands on Li
 - `--polkit` for desktop users who prefer Polkit (`pkexec`) locally.
 - `--dry-run` to preview without elevation.
 - `doctor` / `--doctor` runtime diagnostic mode (GUI/TTY/tools availability + fallback order).
+- `--json` machine-readable output for `doctor` mode.
 - `--sudo-cache` / `--no-sudo-cache` to control sudo timestamp behavior (default: secure no-cache).
 - Optional `SUI_LOG=1` for `${XDG_STATE_HOME}/sui/audit.log`.
 - Syslog audit via `logger -p authpriv.notice` (often merged into `/var/log/auth.log` on traditional setups).
@@ -71,6 +72,7 @@ sui --help
 ```text
 sui [options] [@ssh-host] <command> [args...]
 sui doctor
+sui --doctor --json
 ```
 
 Cache mode examples:
@@ -89,6 +91,7 @@ See `sui --help` or the header of `sui.sh`.
 
 - **GitHub:** `git@github.com:KpihX/sui.git`
 - **GitLab:** `git@gitlab.com:kpihx/sui.git`
+- **Changelog:** see `CHANGELOG.md`.
 
 ### Remotes when embedded in `KpihX/sh`
 
@@ -100,6 +103,23 @@ git remote add gitlab git@gitlab.com:kpihx/sui.git
 ```
 
 Then `make push` from the `sui` repo root pushes both hosts.
+
+## CI and Release Discipline
+
+This project is security/ops-sensitive, so keep release hygiene strict:
+
+- CI (`.github/workflows/ci.yml`) runs:
+  - `bash -n sui.sh`
+  - `shellcheck sui.sh`
+  - smoke checks: `./sui.sh --help` and `./sui.sh --doctor`
+- SemVer policy:
+  - **MAJOR**: breaking CLI/behavior changes.
+  - **MINOR**: backward-compatible features.
+  - **PATCH**: backward-compatible fixes/docs/internal reliability.
+- Every versioned change must update:
+  - `readonly SUI_VERSION` in `sui.sh`
+  - `CHANGELOG.md` with a new top entry.
+- Tag releases as `vX.Y.Z` after CI is green on `main`.
 
 ## Troubleshooting
 
@@ -147,6 +167,7 @@ Quick checks:
 sui doctor
 sui --dry-run apt update
 sui --dry-run @docker-host systemctl restart nginx
+sui --doctor --json
 ```
 
 Authentication retry behavior:

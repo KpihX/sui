@@ -38,7 +38,7 @@
 #     flows (e.g. zenity cancel) without needing `|| true` everywhere.
 set -uo pipefail
 
-readonly SUI_VERSION="3.1.0"
+readonly SUI_VERSION="3.1.1"
 
 # ---------------------------------------------------------------------------
 # Globals (shared state for parse_args, audit logging, and execution helpers)
@@ -69,6 +69,7 @@ SUDO_CACHE=0
 AUTH_MAX_ATTEMPTS=3
 EXIT_CANCELLED=130
 EXIT_AUTH_FAILED=77
+JSON_MODE=0
 
 # ---------------------------------------------------------------------------
 usage() {
@@ -83,6 +84,7 @@ Options (must appear before @target and command):
   --polkit     Local elevation via pkexec (Polkit). Ignored for remote targets.
   --dry-run    Show intent only; no password; no execution.
   --doctor     Print runtime diagnostics (zenity/pkexec/sudo/ssh/gui/tty).
+  --json       Machine-readable output for doctor mode.
   --sudo-cache    Allow sudo timestamp cache (fewer prompts, less strict).
   --no-sudo-cache Enforce secure mode (default): invalidate timestamp each run.
   -h, --help   This help.
@@ -274,6 +276,10 @@ sudo_execute_remote_with_ticket() {
 }
 
 print_doctor() {
+  if [[ "$JSON_MODE" -eq 1 ]]; then
+    print_doctor_json
+    return 0
+  fi
   printf '%s\n' "sui doctor v${SUI_VERSION}"
   printf '%s\n' "---------------------"
   printf 'user: %s (uid %s)\n' "$(id -un)" "$(id -u)"
@@ -290,6 +296,36 @@ print_doctor() {
   printf '%s\n' "fallback-order-local: zenity -> pkexec -> tty-password+sudo"
   printf '%s\n' "fallback-order-remote: zenity -> tty-password+ssh+sudo"
   printf 'sudo-cache-mode: %s\n' "$([[ "$SUDO_CACHE" -eq 1 ]] && echo enabled || echo secure-disabled)"
+}
+
+print_doctor_json() {
+  local tty_in tty_out zenity_ok pkexec_ok sudo_ok ssh_ok gui_ok cache_mode
+  tty_in="$([[ -t 0 ]] && echo true || echo false)"
+  tty_out="$([[ -t 1 ]] && echo true || echo false)"
+  zenity_ok="$({ command -v zenity >/dev/null 2>&1 && echo true || echo false; })"
+  pkexec_ok="$({ command -v pkexec >/dev/null 2>&1 && echo true || echo false; })"
+  sudo_ok="$({ command -v sudo >/dev/null 2>&1 && echo true || echo false; })"
+  ssh_ok="$({ command -v ssh >/dev/null 2>&1 && echo true || echo false; })"
+  gui_ok="$({ have_zenity_gui && echo true || echo false; })"
+  cache_mode="$([[ "$SUDO_CACHE" -eq 1 ]] && echo enabled || echo secure-disabled)"
+  printf '{\n'
+  printf '  "version": "%s",\n' "$SUI_VERSION"
+  printf '  "user": "%s",\n' "$(id -un)"
+  printf '  "uid": %s,\n' "$(id -u)"
+  printf '  "cwd": "%s",\n' "$(pwd)"
+  printf '  "display": "%s",\n' "${DISPLAY:-}"
+  printf '  "wayland_display": "%s",\n' "${WAYLAND_DISPLAY:-}"
+  printf '  "tty_stdin": %s,\n' "$tty_in"
+  printf '  "tty_stdout": %s,\n' "$tty_out"
+  printf '  "zenity": %s,\n' "$zenity_ok"
+  printf '  "pkexec": %s,\n' "$pkexec_ok"
+  printf '  "sudo": %s,\n' "$sudo_ok"
+  printf '  "ssh": %s,\n' "$ssh_ok"
+  printf '  "gui_capable_now": %s,\n' "$gui_ok"
+  printf '  "sudo_cache_mode": "%s",\n' "$cache_mode"
+  printf '  "fallback_order_local": ["zenity", "pkexec", "tty-password+sudo"],\n'
+  printf '  "fallback_order_remote": ["zenity", "tty-password+ssh+sudo"]\n'
+  printf '}\n'
 }
 
 zenity_password() {
@@ -460,6 +496,7 @@ parse_args() {
   DRY_RUN=0
   DOCTOR_MODE=0
   SUDO_CACHE=0
+  JSON_MODE=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --polkit)
@@ -472,6 +509,10 @@ parse_args() {
         ;;
       --doctor)
         DOCTOR_MODE=1
+        shift
+        ;;
+      --json)
+        JSON_MODE=1
         shift
         ;;
       --sudo-cache)
@@ -529,6 +570,16 @@ main() {
   SUI_UID="$(id -u)"
 
   if [[ "${1:-}" == "doctor" ]]; then
+    JSON_MODE=0
+    shift
+    if [[ "${1:-}" == "--json" ]]; then
+      JSON_MODE=1
+      shift
+    fi
+    if [[ $# -gt 0 ]]; then
+      printf '%s\n' "sui: unexpected arguments after doctor." >&2
+      exit 2
+    fi
     print_doctor
     exit 0
   fi
