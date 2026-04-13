@@ -4,7 +4,7 @@ Unified graphical gateway for **local** and **remote** privileged commands on Li
 
 ## Features
 
-- Single Zenity dialog: full command details + password (local default path).
+- Single Zenity dialog: **full argv always shown** in a high-visibility block (chevrons + spacing) plus password (`--forms` on Zenity 4.x).
 - `--polkit` for desktop users who prefer Polkit (`pkexec`) locally.
 - `--dry-run` to preview without elevation.
 - Optional `SUI_LOG=1` for `${XDG_STATE_HOME}/sui/audit.log`.
@@ -79,7 +79,7 @@ Then `make push` from the `sui` repo root pushes both hosts.
 
 Older examples used `zenity --password --text=…`. On Zenity **4.x**, that mode often **drops `--text`** and only shows the generic “Type your password” line, so you cannot see e.g. `apt update` in the dialog.
 
-`sui` **v3.0.1+** uses `zenity --forms` with `--text` (full briefing) and `--add-password` so the command stays visible.
+`sui` **v3.0.1+** uses `zenity --forms` with `--text` (full briefing) and `--add-password`. **v3.0.3+** keeps the exact command line always visible and visually emphasized in the dialog body (never concealed).
 
 ### `MESA-INTEL` lines in the terminal when the dialog opens
 

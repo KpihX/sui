@@ -38,7 +38,7 @@
 #     flows (e.g. zenity cancel) without needing `|| true` everywhere.
 set -uo pipefail
 
-readonly SUI_VERSION="3.0.1"
+readonly SUI_VERSION="3.0.3"
 
 # ---------------------------------------------------------------------------
 # Globals (shared state for parse_args, audit logging, and execution helpers)
@@ -106,32 +106,43 @@ cmd_repr() {
 }
 
 # ---------------------------------------------------------------------------
-# Multi-line body for zenity --password --text=...
-# Why: one window shows BOTH full command details and the password field.
+# Multi-line body for zenity --forms --text=...
+# The argv is always shown in a high-visibility block (never concealed): readability and safety first.
 # ---------------------------------------------------------------------------
 zenity_body() {
-  local mode=$1       # LOCAL-ZENITY | REMOTE-ZENITY | LOCAL-PKEXEC (pkexec uses native dialog; unused here)
+  local mode=$1       # LOCAL-ZENITY | REMOTE-ZENITY | DRY-RUN
   local target=$2
   shift 2
   local pretty
   pretty="$(cmd_repr "$@")"
+  local scope_u
+  scope_u="${SUI_SCOPE^^}"
+
   cat <<EOF
-sui v${SUI_VERSION} — privilege elevation request
+═══════════════════════════════════════════════════════════
+  ${scope_u} ROOT ELEVATION  ·  sui v${SUI_VERSION}
+═══════════════════════════════════════════════════════════
 
-Scope:     ${SUI_SCOPE}
-Target:    ${target}
-Invoker:   ${SUI_INVOKER} (uid ${SUI_UID})
-Host:      $(hostname 2>/dev/null || echo unknown)
-CWD:       $(pwd 2>/dev/null || echo unknown)
-Time:      $(date -Iseconds 2>/dev/null || date)
+Read the COMMAND block below: it is exactly what will run with privileges.
 
-Mode:      ${mode}
+Context
+  Scope:     ${SUI_SCOPE}
+  Target:    ${target}
+  Invoker:   ${SUI_INVOKER} (uid ${SUI_UID})
+  Host:      $(hostname 2>/dev/null || echo unknown)
+  CWD:       $(pwd 2>/dev/null || echo unknown)
+  Time:      $(date -Iseconds 2>/dev/null || date)
+  Channel:   ${mode}
 
-Command (argv, bash-quoted for display):
-${pretty}
+>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+   COMMAND  (exact argv · bash-quoted · runs as root after OK)
+>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 
----
-Verify the command carefully, then enter your password to proceed.
+  ${pretty}
+
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+Enter your password in the field below, or Cancel.
 EOF
 }
 
@@ -186,12 +197,12 @@ zenity_password() {
   # `--forms` honors `--text` and still collects a secret with `--add-password`. A single
   # password field prints only the password on stdout (no separator).
   zenity --forms --title="$title" --text="$text" \
-    --add-password="Password" \
-    --width=720 --height=520
+    --add-password="Password (sudo)" \
+    --width=780 --height=620
 }
 
 notify_dry_run() {
-  local text  text="$(zenity_body "DRY-RUN" "$SUI_TARGET" "$@")"
+  local text text="$(zenity_body "DRY-RUN" "$SUI_TARGET" "$@")"
   if command -v zenity >/dev/null 2>&1 && have_display; then
     zenity --info --title="sui — dry-run" --text="$text" --width=720 --height=480
   else
