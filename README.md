@@ -62,6 +62,17 @@ See `sui --help` or the header of `sui.sh`.
 - **GitHub:** `git@github.com:KpihX/sui.git`
 - **GitLab:** `git@gitlab.com:kpihx/sui.git`
 
+### Remotes when embedded in `KpihX/sh`
+
+The parent `sh` Makefile runs `git push` on each submodule using remotes named **`github`** and **`gitlab`**. After a plain clone of only `sui`, the default remote is often `origin` pointing at GitHub. Align with:
+
+```bash
+git remote rename origin github
+git remote add gitlab git@gitlab.com:kpihx/sui.git
+```
+
+Then `make push` from the `sui` repo root pushes both hosts.
+
 ## License
 
 Private / personal tooling — see repository owner policy.
