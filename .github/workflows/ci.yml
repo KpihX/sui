@@ -14,7 +14,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Bash syntax check
-        run: bash -n sui.sh
+        run: bash -n sui.sh tests/run-stub-tests.sh
 
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
@@ -27,3 +27,6 @@ jobs:
 
       - name: Smoke doctor
         run: ./sui.sh --doctor >/dev/null
+
+      - name: Stub tests
+        run: tests/run-stub-tests.sh

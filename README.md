@@ -4,12 +4,13 @@ Unified graphical gateway for **local** and **remote** privileged commands on Li
 
 ## Features
 
-- Single Zenity dialog: **full argv always shown** in a high-visibility block (chevrons + spacing) plus password (`--forms` on Zenity 4.x).
+- Single Zenity **`--forms`** dialog: **full argv** in the dialog body; fields are **Action** (RUN or ABORT), optional **operator comment**, and **sudo password** (hidden). Internal field separator is ASCII **RS** (`0x1e`), not `|` — you can use `|` in the comment.
 - `--polkit` for desktop users who prefer Polkit (`pkexec`) locally.
 - `--dry-run` to preview without elevation.
 - `doctor` / `--doctor` runtime diagnostic mode (GUI/TTY/tools availability + fallback order).
 - `--json` machine-readable output for `doctor` mode.
-- `--reason "..."` to provide a human rationale shown in the elevation dialog.
+- `--reason "..."` to provide a human rationale shown in the elevation dialog (full text in the GUI only; audit logs use `reason=present` or `reason=<none>`).
+- Optional **operator comment** in the same form: when non-empty, a single stderr line per dialog, e.g. `Sui: OPERATOR-COMMENT (dialog N/3, <tag>): **...**` (not copied into syslog / `audit.log`).
 - `--sudo-cache` / `--no-sudo-cache` to control sudo timestamp behavior (default: secure no-cache).
 - Optional `SUI_LOG=1` for `${XDG_STATE_HOME}/sui/audit.log`.
 - Syslog audit via `logger -p authpriv.notice` (often merged into `/var/log/auth.log` on traditional setups).
@@ -114,9 +115,10 @@ Then `make push` from the `sui` repo root pushes both hosts.
 This project is security/ops-sensitive, so keep release hygiene strict:
 
 - CI (`.github/workflows/ci.yml`) runs:
-  - `bash -n sui.sh`
+  - `bash -n sui.sh tests/run-stub-tests.sh`
   - `shellcheck sui.sh`
   - smoke checks: `./sui.sh --help` and `./sui.sh --doctor`
+  - **`tests/run-stub-tests.sh`** (stubbed zenity/sudo/ssh/logger — no real GUI or privilege)
 - SemVer policy:
   - **MAJOR**: breaking CLI/behavior changes.
   - **MINOR**: backward-compatible features.
@@ -130,9 +132,9 @@ This project is security/ops-sensitive, so keep release hygiene strict:
 
 ### Password dialog does not show the command (Zenity 4.x)
 
-Older examples used `zenity --password --text=…`. On Zenity **4.x**, that mode often **drops `--text`** and only shows the generic “Type your password” line, so you cannot see e.g. `apt update` in the dialog.
+Older examples used `zenity --password --text=…`. On Zenity **4.x**, that mode often **drops `--text`**.
 
-`sui` **v3.0.1+** uses a Zenity prompt mode that keeps `--text` visible. Current builds use `zenity --entry --hide-text` so Enter reliably validates and the command briefing remains visible.
+Current `sui` uses **`zenity --forms`** with a large `--text=` body so the full argv briefing stays visible, plus RUN/ABORT, optional comment, and a password field.
 
 ### What if `zenity` is absent or no GUI is available?
 
@@ -175,10 +177,12 @@ sui --dry-run @docker-host systemctl restart nginx
 sui --doctor --json
 ```
 
-Live interactive smoke suite:
+Automated tests (stubs — no real GUI or sudo):
 
 ```bash
-tests/live-smoke.sh
+make test          # lint + stub suite (local CI-equivalent)
+make test-stubs    # stub tests only
+# or: tests/run-stub-tests.sh
 ```
 
 Authentication retry behavior:
@@ -189,8 +193,11 @@ Authentication retry behavior:
 
 Exit codes:
 
-- `130` → authentication cancelled by user.
+- `0`   → success (or `--help` / `doctor` / `-v`).
+- `2`   → usage / missing command / missing required `--reason` (when enforced).
 - `77`  → authentication failed after max attempts.
+- `127` (or other non-zero) → command failed after successful auth (e.g. missing binary on target).
+- `130` → authentication cancelled by user (ABORT, empty password, closed dialog, etc.).
 
 ## License
 

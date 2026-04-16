@@ -23,11 +23,16 @@
 # Install (example):
 #   install -m 0755 sui.sh /usr/local/bin/sui
 #
+# Develop / verify (from repo clone):
+#   make test          # bash -n + optional shellcheck + stub suite
+#   make test-stubs    # automated regression without real zenity/sudo
+#
 # Notes on auditing:
 #   - Real sudo(8) invocations are still logged by sudoers defaults (e.g. auth.log lines).
 #   - This script adds explicit "sui" syslog entries via logger(1) at authpriv.notice so
 #     operators can grep for the wrapper even when Polkit is used (--polkit).
 #   - Secrets (passwords) are never written to logs.
+#   - The textual --reason is never written to sui audit (syslog / SUI_LOG file): only present or <none>.
 #
 # Shell strictness (why not `set -e` here):
 #   - `-u` / `nounset`: expanding an unset variable is an error. Catches typos and forgotten
@@ -38,7 +43,7 @@
 #     flows (e.g. zenity cancel) without needing `|| true` everywhere.
 set -uo pipefail
 
-readonly SUI_VERSION="3.1.3"
+readonly SUI_VERSION="3.1.22"
 
 # ---------------------------------------------------------------------------
 # Globals (shared state for parse_args, audit logging, and execution helpers)
@@ -72,7 +77,9 @@ EXIT_AUTH_FAILED=77
 JSON_MODE=0
 SUI_REASON=""
 REQUIRE_REASON=1
-REASON_MAX_ATTEMPTS=3
+AUTH_COMMENT=""
+AUTH_ACTION="RUN"
+SHOW_VERSION=0
 
 # ---------------------------------------------------------------------------
 usage() {
@@ -89,6 +96,7 @@ Options (must appear before @target and command):
   --doctor     Print runtime diagnostics (zenity/pkexec/sudo/ssh/gui/tty).
   --json       Machine-readable output for doctor mode.
   --reason TXT Human rationale shown in the privilege dialog.
+  -v, --version Print sui version and exit (no --reason required).
   --sudo-cache    Allow sudo timestamp cache (fewer prompts, less strict).
   --no-sudo-cache Enforce secure mode (default): invalidate timestamp each run.
   -h, --help   This help.
@@ -96,6 +104,9 @@ Options (must appear before @target and command):
 Environment:
   SUI_LOG=1    Also append audit lines to $XDG_STATE_HOME/sui/audit.log (default: ~/.local/state).
   SUI_ZENITY_STDERR=1  Keep zenity stderr visible (default: suppress GUI/MESA noise).
+
+Audit note:
+  Syslog and SUI_LOG lines use reason=present when --reason was set (text shown only in the GUI, not in audit).
 
 Examples:
   sui apt update
@@ -105,7 +116,7 @@ Examples:
 
 Auditing:
   Real runs log via logger(1) at authpriv.notice (often merged into /var/log/auth.log).
-  dry-run uses user.notice. Passwords are never logged.
+  dry-run uses user.notice. Passwords are never logged. --reason body is not copied into audit (see Audit note above).
 EOF
 }
 
@@ -136,7 +147,7 @@ zenity_body() {
 
   cat <<EOF
 ═══════════════════════════════════════════════════════════
-  ${scope_u} ROOT ELEVATION  ·  sui v${SUI_VERSION}
+  ${scope_u} ROOT ELEVATION  ·  Sui v${SUI_VERSION}
 ═══════════════════════════════════════════════════════════
 
 Read the COMMAND block below: it is exactly what will run with privileges.
@@ -159,7 +170,13 @@ COMMAND (exact argv · bash-quoted · runs as root after OK)
 
 =============================================================
 
-Enter your password in the field below, or Cancel.
+Input (single GTK form dialog)
+  • Action: RUN (default) or ABORT, then validate with OK.
+  • Operator comment (optional): extra shell trace shown at the end if non-empty.
+  • Sudo password: your sudo password.
+
+Press Enter in the password field to validate quickly with OK (RUN stays default).
+To abort without elevation: set Action=ABORT and press OK.
 EOF
 }
 
@@ -171,7 +188,14 @@ EOF
 sui_audit() {
   local phase=$1
   local msg
-  msg="phase=${phase} scope=${SUI_SCOPE} target=${SUI_TARGET} invoker=${SUI_INVOKER} uid=${SUI_UID} cmd=${SUI_CMD_REPR} reason=${SUI_REASON:-<none>}"
+  local reason_audit
+  # Do not persist free-text rationale in syslog or audit.log (leak risk to central log stacks).
+  if [[ -n "${SUI_REASON// }" ]]; then
+    reason_audit="present"
+  else
+    reason_audit="<none>"
+  fi
+  msg="phase=${phase} scope=${SUI_SCOPE} target=${SUI_TARGET} invoker=${SUI_INVOKER} uid=${SUI_UID} cmd=${SUI_CMD_REPR} reason=${reason_audit}"
 
   if command -v logger >/dev/null 2>&1; then
     # dry-run is not a real authentication event — keep it out of authpriv by default
@@ -181,7 +205,7 @@ sui_audit() {
       logger -t sui -p authpriv.notice --id=$$ -- "$msg"
     fi
   else
-    printf '%s\n' "sui: logger(1) not found; audit: $msg" >&2
+    printf '%s\n' "Sui: logger(1) not found; audit: $msg" >&2
   fi
 
   if [[ "${SUI_LOG:-0}" == "1" ]]; then
@@ -212,51 +236,78 @@ zenity_run() {
   fi
 }
 
-tty_password_prompt() {
-  local prompt=$1
-  local p1=""
+# TTY fallback when Zenity is unavailable: password (hidden) then optional comment on the next line.
+# Keeps a single logical step without extra GUI popups.
+tty_collect_auth_inputs() {
+  local pwd_prompt=$1
+  PASS=""
+  AUTH_COMMENT=""
   if [[ ! -t 0 ]]; then
     return 1
   fi
-  read -r -s -p "$prompt" p1
+  read -r -s -p "$pwd_prompt" PASS || return 1
   printf '\n' >&2
-  printf '%s' "$p1"
+  read -r -p "Sui: operator comment (optional, empty = skip): " AUTH_COMMENT || AUTH_COMMENT=""
+  return 0
 }
 
 notify_auth_failure() {
   local msg=$1
   # Always print to shell for traceability, even when a GUI popup is shown.
-  printf '%s\n' "sui: $msg" >&2
+  printf '%s\n' "Sui: $msg" >&2
   if have_zenity_gui; then
-    zenity_run --error --title="sui — authentication failed" --text="$msg" --width=520 --height=160 || true
+    zenity_run --error --title="Sui — authentication failed" --text="$msg" --width=520 --height=160 || true
   fi
 }
 
-prompt_reason_retry() {
-  local prompt_title="sui — reason required"
-  local prompt_text="Provide a short rationale for this privileged command."
-  local i reason_input
-  for ((i=1; i<=REASON_MAX_ATTEMPTS; i++)); do
-    if have_zenity_gui; then
-      reason_input="$(zenity_run --entry --title="${prompt_title} [${i}/${REASON_MAX_ATTEMPTS}]" --text="$prompt_text" --width=520 --height=160)" || {
-        printf '%s\n' "sui: rationale input cancelled by user." >&2
-        continue
-      }
-    else
-      if [[ ! -t 0 ]]; then
-        printf '%s\n' "sui: rationale required but no GUI and no interactive TTY." >&2
-        return "$EXIT_CANCELLED"
-      fi
-      read -r -p "sui: rationale [${i}/${REASON_MAX_ATTEMPTS}]: " reason_input || true
-    fi
-    if [[ -n "${reason_input// }" ]]; then
-      SUI_REASON="$reason_input"
-      return 0
-    fi
-    printf '%s\n' "sui: rationale cannot be empty (${i}/${REASON_MAX_ATTEMPTS})." >&2
-  done
-  printf '%s\n' "sui: aborted because rationale was not provided after ${REASON_MAX_ATTEMPTS} attempts." >&2
-  return "$EXIT_CANCELLED"
+emit_sui_rationale_line() {
+  :
+}
+
+# One line per dialog when the operator comment is non-empty (no cumulative footer).
+emit_operator_comment_for_dialog_attempt() {
+  local attempt=$1
+  local tag=$2
+  if [[ -n "${AUTH_COMMENT// }" ]]; then
+    printf '%s\n' "Sui: OPERATOR-COMMENT (dialog ${attempt}/${AUTH_MAX_ATTEMPTS}, ${tag}): **${AUTH_COMMENT}**" >&2
+  fi
+}
+
+emit_empty_password_message() {
+  local scope=$1
+  local rhost=${2:-}
+  if [[ "$scope" == "local" ]]; then
+    printf '%s\n' "Sui: authentication aborted — OK pressed with empty password (local)." >&2
+  else
+    printf '%s\n' "Sui: authentication aborted — OK pressed with empty password (remote @${rhost})." >&2
+  fi
+}
+
+emit_action_abort_message() {
+  local scope=$1
+  local rhost=${2:-}
+  if [[ "$scope" == "local" ]]; then
+    printf '%s\n' "Sui: authentication aborted — Action=ABORT selected (local)." >&2
+  else
+    printf '%s\n' "Sui: authentication aborted — Action=ABORT selected (remote @${rhost})." >&2
+  fi
+}
+
+emit_dialog_closed_message() {
+  local scope=$1
+  local rhost=${2:-}
+  if [[ "$scope" == "local" ]]; then
+    printf '%s\n' "Sui: authentication cancelled — dialog closed without OK (local)." >&2
+  else
+    printf '%s\n' "Sui: authentication cancelled — dialog closed without OK (remote @${rhost})." >&2
+  fi
+}
+
+fail_missing_reason() {
+  printf '%s\n' "Sui: blocked — missing required rationale (--reason)." >&2
+  printf '%s\n' "Sui: this command was not executed." >&2
+  printf '%s\n' "Sui: please relaunch with an explicit reason, then validate in the popup." >&2
+  printf 'Sui: retry example: sui --reason "%s" %s\n' "why this privileged action is needed" "${SUI_CMD_REPR}" >&2
 }
 
 LOCAL_AUTH_FAILED=0
@@ -357,7 +408,7 @@ print_doctor() {
     print_doctor_json
     return 0
   fi
-  printf '%s\n' "sui doctor v${SUI_VERSION}"
+  printf '%s\n' "Sui doctor v${SUI_VERSION}"
   printf '%s\n' "---------------------"
   printf 'user: %s (uid %s)\n' "$(id -un)" "$(id -u)"
   printf 'cwd: %s\n' "$(pwd)"
@@ -405,24 +456,53 @@ print_doctor_json() {
   printf '}\n'
 }
 
-zenity_password() {
+zenity_collect_auth_inputs() {
   local title=$1
   local text=$2
+  local out zec sep
   if ! have_zenity_gui; then
     return 2
   fi
-  # Use --entry --hide-text so Enter in the focused password field validates the dialog
-  # consistently as "OK", while still showing our full command/context text.
-  zenity_run --entry --hide-text --title="$title" --text="$text" \
-    --ok-label="OK" --cancel-label="Cancel" \
-    --width=780 --height=620
+  sep=$'\x1e'
+  out="$(zenity_run --forms \
+    --title="$title" \
+    --text="$text" \
+    --separator="$sep" \
+    --add-combo="Action" \
+    --combo-values="RUN|ABORT" \
+    --add-entry="Operator comment (optional)" \
+    --add-password="Sudo password" \
+    --ok-label="OK" --cancel-label="Close" \
+    --width=780 --height=700)"
+  zec=$?
+  out="${out//$'\r'/}"
+  out="${out%$'\n'}"
+  PASS=""
+  AUTH_COMMENT=""
+  AUTH_ACTION="RUN"
+  # Best-effort parse for action/comment even on non-OK exits.
+  if [[ "$out" == *"$sep"* ]]; then
+    AUTH_ACTION="${out%%"$sep"*}"
+    out="${out#*"$sep"}"
+    if [[ "$out" == *"$sep"* ]]; then
+      AUTH_COMMENT="${out%%"$sep"*}"
+      if [[ "$zec" -eq 0 ]]; then
+        PASS="${out#*"$sep"}"
+      fi
+    elif [[ "$zec" -eq 0 ]]; then
+      PASS="$out"
+    fi
+  elif [[ "$zec" -eq 0 ]]; then
+    PASS="$out"
+  fi
+  return "$zec"
 }
 
 notify_dry_run() {
   local text
   text="$(zenity_body "DRY-RUN" "$SUI_TARGET" "$@")"
   if have_zenity_gui; then
-    zenity_run --info --title="sui — dry-run" --text="$text" --width=720 --height=480
+    zenity_run --info --title="Sui — dry-run" --text="$text" --width=720 --height=480
   else
     printf '%s\n' "$text"
   fi
@@ -439,7 +519,7 @@ run_local_as_root() {
 
 run_local_pkexec() {
   if ! command -v pkexec >/dev/null 2>&1; then
-    printf '%s\n' "sui: pkexec not found (install polkit or use default zenity+sudo path)." >&2
+    printf '%s\n' "Sui: pkexec not found (install polkit or use default zenity+sudo path)." >&2
     return 1
   fi
   sui_audit "invoke"
@@ -450,31 +530,51 @@ run_local_pkexec() {
 
 run_local_zenity_sudo() {
   if ! command -v sudo >/dev/null 2>&1; then
-    printf '%s\n' "sui: sudo not found." >&2
+    printf '%s\n' "Sui: sudo not found." >&2
     return 1
   fi
   local body title zpwd summary attempt
   summary="$(cmd_repr "$@")"
-  title="sui — local sudo [${SUI_INVOKER}] — ${summary}"
+  title="Sui — local sudo [${SUI_INVOKER}] — ${summary}"
   body="$(zenity_body "LOCAL-ZENITY" "local" "$@")"
   for ((attempt=1; attempt<=AUTH_MAX_ATTEMPTS; attempt++)); do
-    zpwd="$(zenity_password "${title} [${attempt}/${AUTH_MAX_ATTEMPTS}]" "$body")"
-    case $? in
-      0) ;;
+    zpwd=""
+    PASS=""
+    AUTH_COMMENT=""
+    zenity_collect_auth_inputs "${title} [${attempt}/${AUTH_MAX_ATTEMPTS}]" "$body"
+    zec=$?
+    case $zec in
+      0)
+        if [[ "${AUTH_ACTION^^}" == "ABORT" ]]; then
+          emit_action_abort_message "local"
+          emit_operator_comment_for_dialog_attempt "$attempt" "after auth failure"
+          sui_audit "cancel"
+          return "$EXIT_CANCELLED"
+        fi
+        zpwd="$PASS"
+        if [[ -z "$zpwd" ]]; then
+          emit_empty_password_message "local"
+          emit_operator_comment_for_dialog_attempt "$attempt" "on empty password"
+          sui_audit "cancel"
+          return "$EXIT_CANCELLED"
+        fi
+        ;;
       2)
         # No GUI zenity available: prefer pkexec locally, then TTY password fallback.
         if command -v pkexec >/dev/null 2>&1; then
           run_local_pkexec "$@"
           return $?
         fi
-        zpwd="$(tty_password_prompt "sui: sudo password for ${SUI_INVOKER}: ")" || {
-          printf '%s\n' "sui: no GUI available and no interactive TTY password input possible." >&2
+        tty_collect_auth_inputs "Sui: sudo password for ${SUI_INVOKER}: " || {
+          printf '%s\n' "Sui: no GUI available and no interactive TTY password input possible." >&2
           sui_audit "cancel"
           return "$EXIT_CANCELLED"
         }
+        zpwd="$PASS"
         ;;
       *)
-        printf '%s\n' "sui: authentication cancelled by user (local)." >&2
+        emit_dialog_closed_message "local"
+        emit_operator_comment_for_dialog_attempt "$attempt" "on dialog closed"
         sui_audit "cancel"
         return "$EXIT_CANCELLED"
         ;;
@@ -486,17 +586,24 @@ run_local_zenity_sudo() {
     unset -v PASS
     if [[ "$local_ec" -eq 0 ]]; then
       sui_audit "invoke"
+      emit_operator_comment_for_dialog_attempt "$attempt" "on successful auth"
       return 0
     fi
     if [[ "$LOCAL_AUTH_FAILED" -ne 1 ]]; then
+      emit_sui_rationale_line
+      emit_operator_comment_for_dialog_attempt "$attempt" "after command error"
       return "$local_ec"
     fi
     if [[ "$attempt" -lt "$AUTH_MAX_ATTEMPTS" ]]; then
       notify_auth_failure "Authentication failed (${attempt}/${AUTH_MAX_ATTEMPTS}). Please try again."
+      emit_operator_comment_for_dialog_attempt "$attempt" "after auth failure"
+    else
+      emit_operator_comment_for_dialog_attempt "$attempt" "after auth failure"
     fi
   done
   notify_auth_failure "Authentication failed ${AUTH_MAX_ATTEMPTS} times. Aborting."
-  printf '%s\n' "sui: local sudo aborted after ${AUTH_MAX_ATTEMPTS} failed attempts." >&2
+  printf '%s\n' "Sui: local sudo aborted after ${AUTH_MAX_ATTEMPTS} failed attempts." >&2
+  emit_sui_rationale_line
   sui_audit "cancel"
   return "$EXIT_AUTH_FAILED"
 }
@@ -533,21 +640,41 @@ run_remote_zenity_sudo() {
   # surfaces as a non-zero ssh exit code.
   local body title zpwd summary attempt
   summary="$(cmd_repr "$@")"
-  title="sui — remote sudo [@${target}] — ${summary}"
+  title="Sui — remote sudo [@${target}] — ${summary}"
   body="$(zenity_body "REMOTE-ZENITY" "$target" "$@")"
   for ((attempt=1; attempt<=AUTH_MAX_ATTEMPTS; attempt++)); do
-    zpwd="$(zenity_password "${title} [${attempt}/${AUTH_MAX_ATTEMPTS}]" "$body")"
-    case $? in
-      0) ;;
+    zpwd=""
+    PASS=""
+    AUTH_COMMENT=""
+    zenity_collect_auth_inputs "${title} [${attempt}/${AUTH_MAX_ATTEMPTS}]" "$body"
+    zec=$?
+    case $zec in
+      0)
+        if [[ "${AUTH_ACTION^^}" == "ABORT" ]]; then
+          emit_action_abort_message "remote" "$target"
+          emit_operator_comment_for_dialog_attempt "$attempt" "after auth failure"
+          sui_audit "cancel"
+          return "$EXIT_CANCELLED"
+        fi
+        zpwd="$PASS"
+        if [[ -z "$zpwd" ]]; then
+          emit_empty_password_message "remote" "$target"
+          emit_operator_comment_for_dialog_attempt "$attempt" "on empty password"
+          sui_audit "cancel"
+          return "$EXIT_CANCELLED"
+        fi
+        ;;
       2)
-        zpwd="$(tty_password_prompt "sui: remote sudo password for @${target}: ")" || {
-          printf '%s\n' "sui: no GUI available and no interactive TTY password input possible." >&2
+        tty_collect_auth_inputs "Sui: remote sudo password for @${target}: " || {
+          printf '%s\n' "Sui: no GUI available and no interactive TTY password input possible." >&2
           sui_audit "cancel"
           return "$EXIT_CANCELLED"
         }
+        zpwd="$PASS"
         ;;
       *)
-        printf '%s\n' "sui: authentication cancelled by user (remote @${target})." >&2
+        emit_dialog_closed_message "remote" "$target"
+        emit_operator_comment_for_dialog_attempt "$attempt" "on dialog closed"
         sui_audit "cancel"
         return "$EXIT_CANCELLED"
         ;;
@@ -559,17 +686,24 @@ run_remote_zenity_sudo() {
     unset -v PASS
     if [[ "$remote_ec" -eq 0 ]]; then
       sui_audit "invoke"
+      emit_operator_comment_for_dialog_attempt "$attempt" "on successful auth"
       return 0
     fi
     if [[ "$REMOTE_AUTH_FAILED" -ne 1 ]]; then
+      emit_sui_rationale_line
+      emit_operator_comment_for_dialog_attempt "$attempt" "after command error"
       return "$remote_ec"
     fi
     if [[ "$attempt" -lt "$AUTH_MAX_ATTEMPTS" ]]; then
       notify_auth_failure "Remote authentication failed (${attempt}/${AUTH_MAX_ATTEMPTS}) for @${target}. Please try again."
+      emit_operator_comment_for_dialog_attempt "$attempt" "after auth failure"
+    else
+      emit_operator_comment_for_dialog_attempt "$attempt" "after auth failure"
     fi
   done
   notify_auth_failure "Remote authentication failed ${AUTH_MAX_ATTEMPTS} times for @${target}. Aborting."
-  printf '%s\n' "sui: remote sudo aborted for @${target} after ${AUTH_MAX_ATTEMPTS} failed attempts." >&2
+  printf '%s\n' "Sui: remote sudo aborted for @${target} after ${AUTH_MAX_ATTEMPTS} failed attempts." >&2
+  emit_sui_rationale_line
   sui_audit "cancel"
   return "$EXIT_AUTH_FAILED"
 }
@@ -605,7 +739,7 @@ parse_args() {
       --reason)
         shift
         if [[ $# -lt 1 ]]; then
-          printf '%s\n' "sui: --reason requires a non-empty value." >&2
+          printf '%s\n' "Sui: --reason requires a non-empty value." >&2
           exit 2
         fi
         SUI_REASON="$1"
@@ -614,7 +748,7 @@ parse_args() {
       --reason=*)
         SUI_REASON="${1#*=}"
         if [[ -z "$SUI_REASON" ]]; then
-          printf '%s\n' "sui: --reason requires a non-empty value." >&2
+          printf '%s\n' "Sui: --reason requires a non-empty value." >&2
           exit 2
         fi
         shift
@@ -639,6 +773,10 @@ parse_args() {
         usage
         exit 0
         ;;
+      -v|--version)
+        SHOW_VERSION=1
+        shift
+        ;;
       --)
         shift
         break
@@ -653,8 +791,12 @@ parse_args() {
     return 0
   fi
 
+  if [[ "$SHOW_VERSION" -eq 1 && $# -lt 1 ]]; then
+    return 0
+  fi
+
   if [[ $# -lt 1 ]]; then
-    printf '%s\n' "sui: missing command (see sui --help)." >&2
+    printf '%s\n' "Sui: missing command (see sui --help)." >&2
     exit 2
   fi
 
@@ -665,7 +807,7 @@ parse_args() {
     SUI_SCOPE="remote"
     shift
     if [[ $# -lt 1 ]]; then
-      printf '%s\n' "sui: missing command after @${SUI_TARGET}." >&2
+      printf '%s\n' "Sui: missing command after @${SUI_TARGET}." >&2
       exit 2
     fi
   fi
@@ -689,7 +831,7 @@ main() {
       shift
     fi
     if [[ $# -gt 0 ]]; then
-      printf '%s\n' "sui: unexpected arguments after doctor." >&2
+      printf '%s\n' "Sui: unexpected arguments after doctor." >&2
       exit 2
     fi
     print_doctor
@@ -697,6 +839,11 @@ main() {
   fi
 
   parse_args "$@"
+
+  if [[ "${SHOW_VERSION:-0}" -eq 1 ]]; then
+    printf '%s\n' "Sui v${SUI_VERSION}"
+    exit 0
+  fi
 
   if [[ "${DOCTOR_MODE:-0}" -eq 1 ]]; then
     print_doctor
@@ -707,7 +854,8 @@ main() {
   SUI_CMD_REPR="$(cmd_repr "${SUI_CMD[@]}")"
 
   if [[ "$REQUIRE_REASON" -eq 1 ]] && [[ -z "${SUI_REASON// }" ]]; then
-    prompt_reason_retry || exit "$?"
+    fail_missing_reason
+    exit 2
   fi
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -729,12 +877,12 @@ main() {
 
   # Remote branch
   if [[ "$USE_POLKIT" -eq 1 ]]; then
-    printf '%s\n' "sui: note: --polkit applies to local elevation only; remote still uses SSH + zenity + sudo." >&2
+    printf '%s\n' "Sui: note: --polkit applies to local elevation only; remote still uses SSH + zenity + sudo." >&2
   fi
 
   local ruid
   ruid="$(ssh -o 'BatchMode=no' -- "$SUI_TARGET" 'id -u' 2>/dev/null)" || {
-    printf '%s\n' "sui: cannot reach ssh target '${SUI_TARGET}' (ssh failed)." >&2
+    printf '%s\n' "Sui: cannot reach ssh target '${SUI_TARGET}' (ssh failed)." >&2
     sui_audit "error"
     exit 1
   }

@@ -4,6 +4,77 @@ All notable changes to `sui` are documented in this file.
 
 The format is inspired by Keep a Changelog and this project follows Semantic Versioning.
 
+## [3.1.22] - 2026-04-16
+
+### Added
+- **`make test`** — runs `lint` (including `bash -n` on `tests/run-stub-tests.sh`) plus **`test-stubs`**.
+
+### Changed
+- **README:** features, CI steps, Zenity troubleshooting, and exit codes aligned with current `--forms` auth UX and audit behavior.
+- **`sui.sh`:** header comment documents **`make test`** / **`make test-stubs`** for contributors.
+
+### Removed
+- **`tests/live-smoke.sh`** — interactive manual smoke script removed; **`make test-stubs`** / `tests/run-stub-tests.sh` is the supported automated regression path.
+
+## [3.1.21] - 2026-04-16
+
+### Added
+- **Stub test suite:** `tests/run-stub-tests.sh` with `tests/stubs/{zenity,sudo,ssh,logger}` — exercises local/remote auth flows, operator-comment tags, exit codes (130 / 77 / 127 / 2), and `reason=present` audit redaction without real GUI or privilege. Run via `make test-stubs` or CI.
+
+## [3.1.20] - 2026-04-16
+
+### Changed
+- **Audit:** when `--reason` is set, syslog / `SUI_LOG` record `reason=present` (SIEM-friendly flag) instead of `reason=[REDACTED]`. Still no free-text rationale in audit.
+
+## [3.1.19] - 2026-04-16
+
+### Security / Changed
+- **Audit redaction:** `sui_audit` syslog and `SUI_LOG` file no longer embed the `--reason` string; they record a non-text marker when a reason was provided, else `reason=<none>`. Full text remains in the Zenity dialog only. Operator comments unchanged (stderr only, not in audit).
+
+## [3.1.9] - 2026-04-13
+
+### Changed
+- Zenity auth uses `--password --username`: first field = operator comment, second = password (GTK sets **Enter** on the password field to activate **OK**).
+- Shell footer order on cancel/abort: cancellation line, then `sui: rationale:` (when `--reason` is set), then `sui: operator-comment:` last.
+- After a plain **Cancel** (no stdout from Zenity), optional follow-up entry captures a shell note.
+- **OK** with empty password aborts without sudo and still prints rationale + comment.
+
+### Notes
+- Zenity prints `comment|password` with a fixed `|`; avoid `|` in the comment field.
+
+## [3.1.8] - 2026-04-13
+
+### Changed
+- Zenity auth form now places **comment first, password last** to improve `Enter`→OK flow from the password field.
+- `sui` now parses form output even when Zenity exits on cancel and prints `operator-comment` when available before cancellation messages.
+
+## [3.1.7] - 2026-04-13
+
+### Changed
+- Zenity auth uses one `--forms` dialog again: **password + optional operator comment** (RS `0x1e` output separator instead of `|` for safer parsing).
+- TTY fallback: hidden password prompt plus one optional comment line (no second GUI popup).
+
+## [3.1.6] - 2026-04-13
+
+### Changed
+- Missing `--reason` now hard-fails immediately in shell (exit 2) with a clear retry instruction.
+- Removed rationale popup prompting path: agents must provide rationale before execution; humans only validate auth popup.
+
+## [3.1.5] - 2026-04-13
+
+### Changed
+- Restored fast Enter-to-OK behavior on password input by using `zenity --entry --hide-text` for authentication.
+- Operator comment capture now uses a follow-up optional UI entry (`Save`/`Skip`) and is still echoed in shell when provided.
+
+## [3.1.4] - 2026-04-13
+
+### Added
+- Authentication popup now includes an optional **operator comment** field.
+- If provided, the operator comment is always echoed in shell output (`sui: operator-comment: ...`) when the dialog is validated.
+
+### Changed
+- Switched auth input collection to Zenity forms mode (password + comment in one dialog).
+
 ## [3.1.3] - 2026-04-13
 
 ### Added
