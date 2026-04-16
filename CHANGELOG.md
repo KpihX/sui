@@ -4,6 +4,11 @@ All notable changes to `sui` are documented in this file.
 
 The format is inspired by Keep a Changelog and this project follows Semantic Versioning.
 
+## [3.1.23] - 2026-04-17
+
+### Added
+- **`-r` / `-r=…`** — shorthand for **`--reason`** / **`--reason=…`** (same validation and audit behavior).
+
 ## [3.1.22] - 2026-04-16
 
 ### Added

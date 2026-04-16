@@ -9,7 +9,7 @@ Unified graphical gateway for **local** and **remote** privileged commands on Li
 - `--dry-run` to preview without elevation.
 - `doctor` / `--doctor` runtime diagnostic mode (GUI/TTY/tools availability + fallback order).
 - `--json` machine-readable output for `doctor` mode.
-- `--reason "..."` to provide a human rationale shown in the elevation dialog (full text in the GUI only; audit logs use `reason=present` or `reason=<none>`).
+- **`--reason "…"`** or **`-r "…"`** for a human rationale in the elevation dialog (full text in the GUI only; audit logs use `reason=present` or `reason=<none>`).
 - Optional **operator comment** in the same form: when non-empty, a single stderr line per dialog, e.g. `Sui: OPERATOR-COMMENT (dialog N/3, <tag>): **...**` (not copied into syslog / `audit.log`).
 - `--sudo-cache` / `--no-sudo-cache` to control sudo timestamp behavior (default: secure no-cache).
 - Optional `SUI_LOG=1` for `${XDG_STATE_HOME}/sui/audit.log`.
@@ -76,6 +76,7 @@ sui [options] [@ssh-host] <command> [args...]
 sui doctor
 sui --doctor --json
 sui --reason "why this needs privilege" <command>
+sui -r "short rationale" <command>
 ```
 
 Cache mode examples:
@@ -87,8 +88,9 @@ sui --no-sudo-cache apt update
 # allow sudo timestamp cache (fewer prompts)
 sui --sudo-cache apt update
 
-# provide rationale visible in the popup
+# provide rationale visible in the popup (--reason or equivalent -r)
 sui --reason "Refresh package metadata before maintenance window" apt update
+sui -r "Refresh package metadata before maintenance window" apt update
 ```
 
 See `sui --help` or the header of `sui.sh`.

@@ -15,6 +15,7 @@
 # Options:
 #   --polkit     Local only: use pkexec(1) instead of the unified zenity+sudo dialog.
 #   --dry-run    Print (and optionally show) what would run; never prompts; no elevation.
+#   --reason TXT | -r TXT  Human rationale for the dialog (audit stores present/<none> only).
 #   -h, --help Show this summary.
 #
 # Environment:
@@ -32,7 +33,7 @@
 #   - This script adds explicit "sui" syslog entries via logger(1) at authpriv.notice so
 #     operators can grep for the wrapper even when Polkit is used (--polkit).
 #   - Secrets (passwords) are never written to logs.
-#   - The textual --reason is never written to sui audit (syslog / SUI_LOG file): only present or <none>.
+#   - The textual --reason / -r value is never written to sui audit (syslog / SUI_LOG file): only present or <none>.
 #
 # Shell strictness (why not `set -e` here):
 #   - `-u` / `nounset`: expanding an unset variable is an error. Catches typos and forgotten
@@ -43,7 +44,7 @@
 #     flows (e.g. zenity cancel) without needing `|| true` everywhere.
 set -uo pipefail
 
-readonly SUI_VERSION="3.1.22"
+readonly SUI_VERSION="3.1.23"
 
 # ---------------------------------------------------------------------------
 # Globals (shared state for parse_args, audit logging, and execution helpers)
@@ -95,7 +96,7 @@ Options (must appear before @target and command):
   --dry-run    Show intent only; no password; no execution.
   --doctor     Print runtime diagnostics (zenity/pkexec/sudo/ssh/gui/tty).
   --json       Machine-readable output for doctor mode.
-  --reason TXT Human rationale shown in the privilege dialog.
+  --reason TXT | -r TXT  Human rationale shown in the privilege dialog (short form: -r).
   -v, --version Print sui version and exit (no --reason required).
   --sudo-cache    Allow sudo timestamp cache (fewer prompts, less strict).
   --no-sudo-cache Enforce secure mode (default): invalidate timestamp each run.
@@ -111,6 +112,7 @@ Audit note:
 Examples:
   sui apt update
   sui --reason "Refresh security indexes" apt update
+  sui -r "Short rationale" apt update
   sui --dry-run @docker-host systemctl restart nginx
   sui --polkit -- gparted
 
@@ -304,7 +306,7 @@ emit_dialog_closed_message() {
 }
 
 fail_missing_reason() {
-  printf '%s\n' "Sui: blocked — missing required rationale (--reason)." >&2
+  printf '%s\n' "Sui: blocked — missing required rationale (--reason or -r)." >&2
   printf '%s\n' "Sui: this command was not executed." >&2
   printf '%s\n' "Sui: please relaunch with an explicit reason, then validate in the popup." >&2
   printf 'Sui: retry example: sui --reason "%s" %s\n' "why this privileged action is needed" "${SUI_CMD_REPR}" >&2
@@ -736,10 +738,10 @@ parse_args() {
         JSON_MODE=1
         shift
         ;;
-      --reason)
+      --reason|-r)
         shift
         if [[ $# -lt 1 ]]; then
-          printf '%s\n' "Sui: --reason requires a non-empty value." >&2
+          printf '%s\n' "Sui: --reason/-r requires a non-empty value." >&2
           exit 2
         fi
         SUI_REASON="$1"
@@ -749,6 +751,14 @@ parse_args() {
         SUI_REASON="${1#*=}"
         if [[ -z "$SUI_REASON" ]]; then
           printf '%s\n' "Sui: --reason requires a non-empty value." >&2
+          exit 2
+        fi
+        shift
+        ;;
+      -r=*)
+        SUI_REASON="${1#-r=}"
+        if [[ -z "$SUI_REASON" ]]; then
+          printf '%s\n' "Sui: -r requires a non-empty value." >&2
           exit 2
         fi
         shift

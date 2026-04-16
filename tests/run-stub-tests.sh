@@ -100,6 +100,28 @@ case_local_success_first() {
   assert_contains "$out" "OPERATOR-COMMENT (dialog 1/3, on successful auth): **win**"
 }
 
+case_local_reason_r_alias() {
+  local ec=0 out
+  init_state
+  export SUI_STUB_ZENITY_RESPONSES="$SUI_TEST_STATE_DIR/z.resp"
+  printf '%s\n' '0|RUN||pw' >"$SUI_STUB_ZENITY_RESPONSES"
+  export SUI_STUB_SUDO_MODES="$SUI_TEST_STATE_DIR/sudo.m"
+  printf '%s\n' "ok" >"$SUI_STUB_SUDO_MODES"
+  out="$(run_sui --__no-require-reason -r "r-alias-test" true 2>&1)" || ec=$?
+  assert_eq "$ec" 0
+}
+
+case_local_reason_r_equals_form() {
+  local ec=0 out
+  init_state
+  export SUI_STUB_ZENITY_RESPONSES="$SUI_TEST_STATE_DIR/z.resp"
+  printf '%s\n' '0|RUN||pw' >"$SUI_STUB_ZENITY_RESPONSES"
+  export SUI_STUB_SUDO_MODES="$SUI_TEST_STATE_DIR/sudo.m"
+  printf '%s\n' "ok" >"$SUI_STUB_SUDO_MODES"
+  out="$(run_sui --__no-require-reason -r=r-equals true 2>&1)" || ec=$?
+  assert_eq "$ec" 0
+}
+
 case_local_retry_then_success() {
   local ec=0 out
   init_state
@@ -285,6 +307,8 @@ local_abort
 local_empty_password
 local_dialog_closed
 local_success_first
+local_reason_r_alias
+local_reason_r_equals_form
 local_retry_then_success
 local_three_auth_failures
 local_third_dialog_empty_password
