@@ -4,6 +4,21 @@ All notable changes to `sui` are documented in this file.
 
 The format is inspired by Keep a Changelog and this project follows Semantic Versioning.
 
+## [3.2.0] - 2026-04-22
+
+### Added
+- **Modernized POSIX Argument Parser** — Complete refactor of `parse_args` to align with standard Unix conventions.
+- **Combined Flags** — Group multiple flags (e.g., `sui -dr "Rationale" command`).
+- **Sticky Arguments** — Support for combined prefix and value (e.g., `sui -r"Rationale" command`).
+- **Universal Aliases** — Short aliases for all options: `-p` (polkit), `-d` (dry-run), `-D` (doctor), `-j` (json), `-s` (sudo-cache), `-S` (no-sudo-cache), `-v` (version), `-h` (help).
+- **Sticky -r=VAL** — Preserved backward compatibility for `--reason=VAL` and `-r=VAL` formats.
+
+### Changed
+- **Zero-Regression Parser** — Positional arguments and `@target` detection logic fully preserved and isolated from option parsing.
+- **Strict Consumables** — Options no longer consume flags as values (e.g., `sui -r -d ls` now correctly identifies `-d` as a flag).
+- **Cleaned Feature Creep** — Removed `SUI_ZENITY_STDERR` and `pkexec` TTY fallback to maintain core focus and stability.
+- **Audit Logging** — Improved `sui_audit` consistency across local and remote scopes.
+
 ## [3.1.23] - 2026-04-17
 
 ### Added

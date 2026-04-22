@@ -7,9 +7,10 @@ Unified graphical gateway for **local** and **remote** privileged commands on Li
 - Single Zenity **`--forms`** dialog: **full argv** in the dialog body; fields are **Action** (RUN or ABORT), optional **operator comment**, and **sudo password** (hidden). Internal field separator is ASCII **RS** (`0x1e`), not `|` — you can use `|` in the comment.
 - `--polkit` for desktop users who prefer Polkit (`pkexec`) locally.
 - `--dry-run` to preview without elevation.
-- `doctor` / `--doctor` runtime diagnostic mode (GUI/TTY/tools availability + fallback order).
+- `doctor` / `-D` / `--doctor` runtime diagnostic mode (GUI/TTY/tools availability + fallback order).
 - `--json` machine-readable output for `doctor` mode.
 - **`--reason "…"`** or **`-r "…"`** for a human rationale in the elevation dialog (full text in the GUI only; audit logs use `reason=present` or `reason=<none>`).
+- **Combined Flags & Sticky Args** — Supports POSIX-style grouping (e.g., `-dr"Test"`) and sticky arguments (`-r"Reason"`).
 - Optional **operator comment** in the same form: when non-empty, a single stderr line per dialog, e.g. `Sui: OPERATOR-COMMENT (dialog N/3, <tag>): **...**` (not copied into syslog / `audit.log`).
 - `--sudo-cache` / `--no-sudo-cache` to control sudo timestamp behavior (default: secure no-cache).
 - Optional `SUI_LOG=1` for `${XDG_STATE_HOME}/sui/audit.log`.

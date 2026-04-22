@@ -44,7 +44,7 @@
 #     flows (e.g. zenity cancel) without needing `|| true` everywhere.
 set -uo pipefail
 
-readonly SUI_VERSION="3.1.23"
+readonly SUI_VERSION="3.2.0"
 
 # ---------------------------------------------------------------------------
 # Globals (shared state for parse_args, audit logging, and execution helpers)
@@ -92,33 +92,25 @@ Usage:
   sui doctor
 
 Options (must appear before @target and command):
-  --polkit     Local elevation via pkexec (Polkit). Ignored for remote targets.
-  --dry-run    Show intent only; no password; no execution.
-  --doctor     Print runtime diagnostics (zenity/pkexec/sudo/ssh/gui/tty).
-  --json       Machine-readable output for doctor mode.
-  --reason TXT | -r TXT  Human rationale shown in the privilege dialog (short form: -r).
-  -v, --version Print sui version and exit (no --reason required).
-  --sudo-cache    Allow sudo timestamp cache (fewer prompts, less strict).
-  --no-sudo-cache Enforce secure mode (default): invalidate timestamp each run.
-  -h, --help   This help.
+  -p, --polkit     Local elevation via pkexec (Polkit). Ignored for remote targets.
+  -d, --dry-run    Show intent only; no password; no execution.
+  -D, --doctor     Print runtime diagnostics (zenity/pkexec/sudo/ssh/gui/tty).
+  -j, --json       Machine-readable output (use with -D).
+  -r, --reason TXT Human rationale shown in the privilege dialog.
+  -v, --version    Print sui version and exit (no --reason required).
+  -s, --sudo-cache Allow sudo timestamp cache (fewer prompts, less strict).
+  -S, --no-sudo-cache Enforce secure mode (default): invalidate timestamp each run.
+  -h, --help       This help.
 
 Environment:
   SUI_LOG=1    Also append audit lines to $XDG_STATE_HOME/sui/audit.log (default: ~/.local/state).
-  SUI_ZENITY_STDERR=1  Keep zenity stderr visible (default: suppress GUI/MESA noise).
-
-Audit note:
-  Syslog and SUI_LOG lines use reason=present when --reason was set (text shown only in the GUI, not in audit).
 
 Examples:
   sui apt update
   sui --reason "Refresh security indexes" apt update
   sui -r "Short rationale" apt update
-  sui --dry-run @docker-host systemctl restart nginx
+  sui @docker-host systemctl restart nginx
   sui --polkit -- gparted
-
-Auditing:
-  Real runs log via logger(1) at authpriv.notice (often merged into /var/log/auth.log).
-  dry-run uses user.notice. Passwords are never logged. --reason body is not copied into audit (see Audit note above).
 EOF
 }
 
@@ -230,12 +222,7 @@ have_zenity_gui() {
 
 zenity_run() {
   # Force GTK software/cairo rendering to avoid noisy Vulkan/MESA warnings on some Intel stacks.
-  # By default we silence remaining GUI stderr noise; set SUI_ZENITY_STDERR=1 to debug.
-  if [[ "${SUI_ZENITY_STDERR:-0}" == "1" ]]; then
-    GSK_RENDERER=cairo zenity "$@"
-  else
-    GSK_RENDERER=cairo zenity "$@" 2>/dev/null
-  fi
+  GSK_RENDERER=cairo zenity "$@" 2>/dev/null
 }
 
 # TTY fallback when Zenity is unavailable: password (hidden) then optional comment on the next line.
@@ -562,11 +549,6 @@ run_local_zenity_sudo() {
         fi
         ;;
       2)
-        # No GUI zenity available: prefer pkexec locally, then TTY password fallback.
-        if command -v pkexec >/dev/null 2>&1; then
-          run_local_pkexec "$@"
-          return $?
-        fi
         tty_collect_auth_inputs "Sui: sudo password for ${SUI_INVOKER}: " || {
           printf '%s\n' "Sui: no GUI available and no interactive TTY password input possible." >&2
           sui_audit "cancel"
@@ -714,82 +696,96 @@ run_remote_zenity_sudo() {
 # Parse argv: [options] [@host] command ...
 # ---------------------------------------------------------------------------
 parse_args() {
+  # Initialization
+  SUI_TARGET="local"
+  SUI_SCOPE="local"
   USE_POLKIT=0
   DRY_RUN=0
   DOCTOR_MODE=0
   SUDO_CACHE=0
   JSON_MODE=0
   SUI_REASON=""
+  SHOW_VERSION=0
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --polkit)
-        USE_POLKIT=1
-        shift
-        ;;
-      --dry-run)
-        DRY_RUN=1
-        shift
-        ;;
-      --doctor)
-        DOCTOR_MODE=1
-        shift
-        ;;
-      --json)
-        JSON_MODE=1
-        shift
-        ;;
-      --reason|-r)
-        shift
-        if [[ $# -lt 1 ]]; then
-          printf '%s\n' "Sui: --reason/-r requires a non-empty value." >&2
-          exit 2
-        fi
-        SUI_REASON="$1"
-        shift
-        ;;
+      --polkit)    USE_POLKIT=1; shift ;;
+      --dry-run)   DRY_RUN=1;    shift ;;
+      --doctor)    DOCTOR_MODE=1; shift ;;
+      --json)      JSON_MODE=1;   shift ;;
+      --sudo-cache) SUDO_CACHE=1; shift ;;
+      --no-sudo-cache) SUDO_CACHE=0; shift ;;
+      --__require-reason) REQUIRE_REASON=1; shift ;;
+      --__no-require-reason) REQUIRE_REASON=0; shift ;;
+      --version)   SHOW_VERSION=1; shift ;;
+      --help)      usage; exit 0 ;;
       --reason=*)
         SUI_REASON="${1#*=}"
-        if [[ -z "$SUI_REASON" ]]; then
-          printf '%s\n' "Sui: --reason requires a non-empty value." >&2
-          exit 2
-        fi
+        [[ -z "$SUI_REASON" ]] && { printf 'Sui: --reason requires a value.\n' >&2; exit 2; }
+        shift ;;
+      --reason)
         shift
-        ;;
+        [[ $# -lt 1 || "$1" == -* ]] && { printf 'Sui: --reason requires a value.\n' >&2; exit 2; }
+        SUI_REASON="$1"; shift ;;
       -r=*)
         SUI_REASON="${1#-r=}"
-        if [[ -z "$SUI_REASON" ]]; then
-          printf '%s\n' "Sui: -r requires a non-empty value." >&2
-          exit 2
+        [[ -z "$SUI_REASON" ]] && { printf 'Sui: -r requires a value.\n' >&2; exit 2; }
+        shift ;;
+      @*)
+        if [[ "$SUI_SCOPE" == "local" ]]; then
+          SUI_TARGET="${1#@}"
+          SUI_SCOPE="remote"
+          shift
+          if [[ $# -lt 1 ]]; then
+            printf 'Sui: missing command after @%s.\n' "$SUI_TARGET" >&2
+            exit 2
+          fi
+        else
+          # Already has a target, stop parsing here
+          break
         fi
-        shift
         ;;
-      --__require-reason)
-        REQUIRE_REASON=1
-        shift
-        ;;
-      --__no-require-reason)
-        REQUIRE_REASON=0
-        shift
-        ;;
-      --sudo-cache)
-        SUDO_CACHE=1
-        shift
-        ;;
-      --no-sudo-cache)
-        SUDO_CACHE=0
-        shift
-        ;;
-      -h|--help)
-        usage
-        exit 0
-        ;;
-      -v|--version)
-        SHOW_VERSION=1
+      doctor)
+        DOCTOR_MODE=1
         shift
         ;;
       --)
         shift
         break
+        ;;
+      -*)
+        local opt_string="${1#-}"
+        shift
+        while [[ -n "$opt_string" ]]; do
+          local opt="${opt_string:0:1}"
+          opt_string="${opt_string:1}"
+          case "$opt" in
+            p) USE_POLKIT=1 ;;
+            d) DRY_RUN=1 ;;
+            D) DOCTOR_MODE=1 ;;
+            j) JSON_MODE=1 ;;
+            s) SUDO_CACHE=1 ;;
+            S) SUDO_CACHE=0 ;;
+            v) SHOW_VERSION=1 ;;
+            h) usage; exit 0 ;;
+            r)
+              if [[ -n "$opt_string" ]]; then
+                SUI_REASON="$opt_string"
+                opt_string=""
+              elif [[ $# -gt 0 && "$1" != -* ]]; then
+                SUI_REASON="$1"
+                shift
+              else
+                printf 'Sui: -r requires a value (cannot start with -).\n' >&2
+                exit 2
+              fi
+              ;;
+            *)
+              printf 'Sui: unrecognized option -%s\n' "$opt" >&2
+              exit 2
+              ;;
+          esac
+        done
         ;;
       *)
         break
@@ -797,29 +793,17 @@ parse_args() {
     esac
   done
 
+  # Process diagnostic modes that don't require a command
   if [[ "$DOCTOR_MODE" -eq 1 && $# -lt 1 ]]; then
     return 0
   fi
-
   if [[ "$SHOW_VERSION" -eq 1 && $# -lt 1 ]]; then
     return 0
   fi
 
   if [[ $# -lt 1 ]]; then
-    printf '%s\n' "Sui: missing command (see sui --help)." >&2
+    printf 'Sui: missing command (see sui --help).\n' >&2
     exit 2
-  fi
-
-  SUI_TARGET="local"
-  SUI_SCOPE="local"
-  if [[ "$1" == @* ]]; then
-    SUI_TARGET="${1#@}"
-    SUI_SCOPE="remote"
-    shift
-    if [[ $# -lt 1 ]]; then
-      printf '%s\n' "Sui: missing command after @${SUI_TARGET}." >&2
-      exit 2
-    fi
   fi
 
   # Remaining positional parameters are exactly what we must exec (preserve argv).
@@ -832,21 +816,6 @@ parse_args() {
 main() {
   SUI_INVOKER="$(id -un)"
   SUI_UID="$(id -u)"
-
-  if [[ "${1:-}" == "doctor" ]]; then
-    JSON_MODE=0
-    shift
-    if [[ "${1:-}" == "--json" ]]; then
-      JSON_MODE=1
-      shift
-    fi
-    if [[ $# -gt 0 ]]; then
-      printf '%s\n' "Sui: unexpected arguments after doctor." >&2
-      exit 2
-    fi
-    print_doctor
-    exit 0
-  fi
 
   parse_args "$@"
 
